@@ -16,7 +16,7 @@ const https = require("https");
 const http  = require("http");
 
 // ========================
-//  HTTP Helper (بدون fetch)
+//  HTTP Helper
 // ========================
 function request(url, options = {}, body = null) {
   return new Promise((resolve, reject) => {
@@ -31,6 +31,11 @@ function request(url, options = {}, body = null) {
         headers : options.headers || {},
       },
       (res) => {
+        if (res.statusCode === 301 || res.statusCode === 302) {
+          const location = res.headers["location"];
+          if (location) return request(location, options, body).then(resolve).catch(reject);
+        }
+
         let data = "";
         res.on("data", (chunk) => (data += chunk));
         res.on("end", () => {
@@ -81,46 +86,74 @@ function extractShortcode(url) {
 }
 
 function instagramHeaders() {
-  const headers = {
-    "User-Agent"     : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept"         : "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer"        : "https://www.instagram.com/",
-    "X-IG-App-ID"   : "936619743392459",
+  const cookie = SESSION_ID
+    ? `sessionid=${SESSION_ID}; ig_did=1; csrftoken=missing`
+    : "";
+
+  return {
+    "User-Agent"      : "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Accept"          : "application/json, text/plain, */*",
+    "Accept-Language" : "en-US,en;q=0.9",
+    "Accept-Encoding" : "identity",
+    "Referer"         : "https://www.instagram.com/",
+    "Origin"          : "https://www.instagram.com",
+    "X-IG-App-ID"     : "936619743392459",
+    "X-Requested-With": "XMLHttpRequest",
+    "Cookie"          : cookie,
   };
-  if (SESSION_ID) headers["Cookie"] = `sessionid=${SESSION_ID}`;
-  return headers;
+}
+
+// تبدیل shortcode به media ID
+function shortcodeToId(shortcode) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let id = BigInt(0);
+  for (const char of shortcode) {
+    id = id * BigInt(64) + BigInt(alphabet.indexOf(char));
+  }
+  return id.toString();
 }
 
 async function fetchComments(shortcode) {
-  const variables = JSON.stringify({ shortcode, first: 50 });
-  const url =
-    `https://www.instagram.com/graphql/query/?query_hash=bc3296d1ce80a24b1b6e40b1e72903f5` +
-    `&variables=${encodeURIComponent(variables)}`;
+  const mediaId = shortcodeToId(shortcode);
+
+  // روش ۱: API v1
+  const url = `https://www.instagram.com/api/v1/media/${mediaId}/comments/?can_support_threading=true&permalink_enabled=false`;
+  console.log("Trying API v1:", url);
 
   const res = await request(url, { headers: instagramHeaders() });
+  console.log("API v1 status:", res.status);
 
-  if (res.status !== 200) throw new Error(`Instagram خطا: ${res.status}`);
+  if (res.status === 200 && res.body?.comments) {
+    return res.body.comments.map((c) => ({
+      username: c.user?.username ?? "ناشناس",
+      text    : c.text,
+    }));
+  }
 
-  const media = res.body?.data?.shortcode_media;
-  if (!media) return await fetchCommentsAlt(shortcode);
-
-  return (media.edge_media_to_parent_comment?.edges ?? []).map((e) => ({
-    username: e.node.owner.username,
-    text    : e.node.text,
-  }));
+  // روش ۲: صفحه پست
+  return await fetchCommentsFromPage(shortcode);
 }
 
-async function fetchCommentsAlt(shortcode) {
+async function fetchCommentsFromPage(shortcode) {
   const url = `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`;
-  const res = await request(url, { headers: instagramHeaders() });
+  console.log("Trying page:", url);
 
-  if (res.status !== 200) throw new Error(`دریافت ناموفق (${res.status})`);
+  const res = await request(url, { headers: instagramHeaders() });
+  console.log("Page status:", res.status);
+
+  if (res.status !== 200) {
+    throw new Error(
+      `اینستاگرام پاسخ نداد (${res.status}).\nSESSION_ID را بررسی کنید.`
+    );
+  }
 
   const media =
-    res.body?.graphql?.shortcode_media || res.body?.items?.[0];
+    res.body?.graphql?.shortcode_media ||
+    res.body?.items?.[0];
 
-  if (!media) throw new Error("ساختار پاسخ ناشناخته");
+  if (!media) {
+    throw new Error("ساختار پاسخ اینستاگرام ناشناخته است.");
+  }
 
   if (media.edge_media_to_parent_comment) {
     return media.edge_media_to_parent_comment.edges.map((e) => ({
@@ -129,10 +162,14 @@ async function fetchCommentsAlt(shortcode) {
     }));
   }
 
-  return (media.comments ?? []).map((c) => ({
-    username: c.user?.username ?? "ناشناس",
-    text    : c.text,
-  }));
+  if (media.comments) {
+    return media.comments.map((c) => ({
+      username: c.user?.username ?? "ناشناس",
+      text    : c.text,
+    }));
+  }
+
+  throw new Error("کامنتی در پاسخ اینستاگرام پیدا نشد.");
 }
 
 function filterByKeyword(comments, keyword) {
@@ -189,8 +226,8 @@ async function handleMessage(msg) {
   }
 
   if (session.state === "WAIT_KEYWORD") {
-    const keyword     = text;
-    session.state     = "PROCESSING";
+    const keyword = text;
+    session.state = "PROCESSING";
 
     await sendMessage(chatId, "⏳ در حال دریافت کامنت‌ها از اینستاگرام...");
 
@@ -204,7 +241,6 @@ async function handleMessage(msg) {
         chatId,
         "❌ <b>خطا در دریافت کامنت‌ها:</b>\n" +
         `<code>${err.message}</code>\n\n` +
-        "ممکن است پست خصوصی باشد یا SESSION_ID نیاز باشد.\n\n" +
         "لینک جدید بفرستید:"
       );
     }
@@ -276,8 +312,7 @@ async function poll() {
 }
 
 // ========================
-//  HTTP Server (برای Railway)
-//  Railway نیاز دارد یک پورت باز باشد
+//  HTTP Server
 // ========================
 http
   .createServer((req, res) => {
