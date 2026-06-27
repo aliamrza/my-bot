@@ -1,6 +1,6 @@
 /**
  * ربات قرعه‌کشی اینستاگرام - نسخه Railway
- * بدون هیچ کتابخانه خارجی - فقط Node.js
+ * با پشتیبانی از pagination (همه کامنت‌ها)
  */
 
 const BOT_TOKEN  = process.env.BOT_TOKEN;
@@ -60,10 +60,7 @@ function request(url, options = {}, body = null) {
 async function telegramRequest(method, body = {}) {
   const res = await request(
     `https://api.telegram.org/bot${BOT_TOKEN}/${method}`,
-    {
-      method : "POST",
-      headers: { "Content-Type": "application/json" },
-    },
+    { method: "POST", headers: { "Content-Type": "application/json" } },
     body
   );
   return res.body;
@@ -72,6 +69,15 @@ async function telegramRequest(method, body = {}) {
 async function sendMessage(chatId, text) {
   return telegramRequest("sendMessage", {
     chat_id   : chatId,
+    text,
+    parse_mode: "HTML",
+  });
+}
+
+async function editMessage(chatId, messageId, text) {
+  return telegramRequest("editMessageText", {
+    chat_id   : chatId,
+    message_id: messageId,
     text,
     parse_mode: "HTML",
   });
@@ -103,7 +109,6 @@ function instagramHeaders() {
   };
 }
 
-// تبدیل shortcode به media ID
 function shortcodeToId(shortcode) {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
   let id = BigInt(0);
@@ -113,63 +118,73 @@ function shortcodeToId(shortcode) {
   return id.toString();
 }
 
-async function fetchComments(shortcode) {
-  const mediaId = shortcodeToId(shortcode);
-
-  // روش ۱: API v1
-  const url = `https://www.instagram.com/api/v1/media/${mediaId}/comments/?can_support_threading=true&permalink_enabled=false`;
-  console.log("Trying API v1:", url);
-
-  const res = await request(url, { headers: instagramHeaders() });
-  console.log("API v1 status:", res.status);
-
-  if (res.status === 200 && res.body?.comments) {
-    return res.body.comments.map((c) => ({
-      username: c.user?.username ?? "ناشناس",
-      text    : c.text,
-    }));
-  }
-
-  // روش ۲: صفحه پست
-  return await fetchCommentsFromPage(shortcode);
+// تاخیر بین درخواست‌ها تا اینستاگرام block نکند
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-async function fetchCommentsFromPage(shortcode) {
-  const url = `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`;
-  console.log("Trying page:", url);
+/**
+ * همه کامنت‌ها را با pagination می‌گیرد
+ * هر صفحه ~20 کامنت - تا 100 صفحه (2000 کامنت)
+ */
+async function fetchAllComments(shortcode, onProgress) {
+  const mediaId  = shortcodeToId(shortcode);
+  const allComments = [];
+  let minId      = null; // cursor برای pagination
+  let page       = 0;
+  const MAX_PAGES = 100; // حداکثر 100 صفحه = ~2000 کامنت
 
-  const res = await request(url, { headers: instagramHeaders() });
-  console.log("Page status:", res.status);
+  while (page < MAX_PAGES) {
+    page++;
 
-  if (res.status !== 200) {
-    throw new Error(
-      `اینستاگرام پاسخ نداد (${res.status}).\nSESSION_ID را بررسی کنید.`
-    );
+    let url = `https://www.instagram.com/api/v1/media/${mediaId}/comments/?can_support_threading=true&permalink_enabled=false`;
+    if (minId) url += `&min_id=${minId}`;
+
+    console.log(`صفحه ${page} - cursor: ${minId}`);
+
+    const res = await request(url, { headers: instagramHeaders() });
+
+    console.log(`صفحه ${page} - status: ${res.status}`);
+
+    if (res.status !== 200) {
+      if (page === 1) {
+        throw new Error(`اینستاگرام پاسخ نداد (${res.status}). SESSION_ID را بررسی کنید.`);
+      }
+      // اگر صفحات بعدی خطا داشت، با همان تعداد ادامه می‌دهیم
+      console.log("توقف pagination به دلیل خطا");
+      break;
+    }
+
+    const body = res.body;
+    const comments = body?.comments ?? [];
+
+    if (comments.length === 0) break;
+
+    for (const c of comments) {
+      allComments.push({
+        username: c.user?.username ?? "ناشناس",
+        text    : c.text,
+      });
+    }
+
+    // اطلاع‌رسانی پیشرفت
+    if (onProgress) await onProgress(allComments.length);
+
+    // بررسی اینکه صفحه بعدی وجود دارد
+    const hasMoreComments = body?.has_more_comments ?? false;
+    const nextMinId       = body?.next_min_id ?? body?.next_max_id ?? null;
+
+    console.log(`has_more: ${hasMoreComments}, next_id: ${nextMinId}, total: ${allComments.length}`);
+
+    if (!hasMoreComments || !nextMinId) break;
+
+    minId = nextMinId;
+
+    // تاخیر 1 ثانیه بین صفحات
+    await sleep(1000);
   }
 
-  const media =
-    res.body?.graphql?.shortcode_media ||
-    res.body?.items?.[0];
-
-  if (!media) {
-    throw new Error("ساختار پاسخ اینستاگرام ناشناخته است.");
-  }
-
-  if (media.edge_media_to_parent_comment) {
-    return media.edge_media_to_parent_comment.edges.map((e) => ({
-      username: e.node.owner.username,
-      text    : e.node.text,
-    }));
-  }
-
-  if (media.comments) {
-    return media.comments.map((c) => ({
-      username: c.user?.username ?? "ناشناس",
-      text    : c.text,
-    }));
-  }
-
-  throw new Error("کامنتی در پاسخ اینستاگرام پیدا نشد.");
+  return allComments;
 }
 
 function filterByKeyword(comments, keyword) {
@@ -229,11 +244,30 @@ async function handleMessage(msg) {
     const keyword = text;
     session.state = "PROCESSING";
 
-    await sendMessage(chatId, "⏳ در حال دریافت کامنت‌ها از اینستاگرام...");
+    // پیام اولیه که آپدیت می‌شود
+    const progressMsg = await sendMessage(
+      chatId,
+      "⏳ در حال دریافت کامنت‌ها...\n📥 <b>0</b> کامنت دریافت شد"
+    );
+    const progressMsgId = progressMsg?.result?.message_id;
+
+    let lastReported = 0;
+
+    async function onProgress(count) {
+      // هر 50 کامنت یک بار پیام را آپدیت کن
+      if (count - lastReported >= 50 && progressMsgId) {
+        lastReported = count;
+        await editMessage(
+          chatId,
+          progressMsgId,
+          `⏳ در حال دریافت کامنت‌ها...\n📥 <b>${count}</b> کامنت دریافت شد`
+        ).catch(() => {});
+      }
+    }
 
     let comments;
     try {
-      comments = await fetchComments(session.shortcode);
+      comments = await fetchAllComments(session.shortcode, onProgress);
     } catch (err) {
       console.error("خطای اینستاگرام:", err.message);
       sessions[chatId] = { state: "WAIT_LINK" };
@@ -267,7 +301,7 @@ async function handleMessage(msg) {
     return sendMessage(
       chatId,
       `🎉 <b>قرعه‌کشی انجام شد!</b>\n\n` +
-      `📊 کل کامنت‌ها: <b>${comments.length}</b>\n` +
+      `📊 کل کامنت‌های دریافتی: <b>${comments.length}</b>\n` +
       `✅ واجد شرایط: <b>${matched.length}</b>\n\n` +
       `🏆 <b>برنده:</b>\n` +
       `👤 <code>@${winner.username}</code>\n` +
@@ -277,7 +311,7 @@ async function handleMessage(msg) {
   }
 
   if (session.state === "PROCESSING") {
-    return sendMessage(chatId, "⏳ صبر کنید، در حال پردازش هستیم...");
+    return sendMessage(chatId, "⏳ صبر کنید، در حال دریافت کامنت‌ها هستیم...");
   }
 }
 
